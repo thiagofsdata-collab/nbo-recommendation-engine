@@ -28,8 +28,8 @@ DROP TABLE IF EXISTS customers CASCADE;
 CREATE TABLE customers (
     customer_id BIGINT PRIMARY KEY,   
     employee_index VARCHAR(2),                 
-    country VARCHAR(3),                  
-    sex VARCHAR(1),                   
+    country VARCHAR(5),                  
+    sex VARCHAR(2),                   
     first_contract_date DATE,                      
     foreigner_index BOOLEAN,                      
     spouse_of_employee BOOLEAN,                     
