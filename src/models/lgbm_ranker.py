@@ -17,6 +17,7 @@ from sqlalchemy import create_engine
 from dotenv import load_dotenv
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import roc_auc_score
+from propensity_model import FEATURES as PROPENSITY_FEATURES
 
 from baseline import compute_popularity, recommend_baseline, evaluate_baseline
 
@@ -61,8 +62,9 @@ BOOL_FEATURES = [
 
 ALL_FEATURES = NUMERIC_FEATURES + BOOL_FEATURES + CATEGORICAL_FEATURES + ["acquisition_channel_freq"]
 
+PARQUET_PATH = "data/processed/training_dataset.parquet"
 
-def load_training_data(engine):
+def load_training_data(engine, propense_customers=None):
     """
     Load mart_training_dataset from the database, preprocess features,
     split by customer_id (80/20), and return training/validation sets.
@@ -78,13 +80,14 @@ def load_training_data(engine):
     8. Return X_train, X_val, y_train, y_val, groups_train
     """
     log.info("Loading mart_training_dataset from database...")
-
-
-    PARQUET_PATH = "data/processed/training_dataset.parquet"
-
     log.info("Loading from parquet cache...")
     df = pd.read_parquet(PARQUET_PATH)
     log.info(f"Loaded {len(df):,} rows and {df.shape[1]} columns.")
+
+    if propense_customers is not None:
+        before = len(df)
+        df = df[df["customer_id"].isin(propense_customers)].reset_index(drop=True)
+        log.info(f"Propensity filter: {before:,} → {len(df):,} rows")
 
     required_raw = (
         NUMERIC_FEATURES
@@ -151,7 +154,9 @@ def load_training_data(engine):
         f"val: {groups.iloc[val_idx].nunique():,}"
     )
 
-    return X_train, X_val, y_train, y_val, groups_train
+    val_customer_ids = groups.iloc[val_idx].unique()
+
+    return X_train, X_val, y_train, y_val, groups_train, val_customer_ids
 
 
 def train_model(
@@ -271,73 +276,119 @@ if __name__ == "__main__":
     # -----------------------------------------------------------
     # 1. Load and prepare data
     # -----------------------------------------------------------
-    X_train, X_val, y_train, y_val, groups_train = load_training_data(engine)
 
-    log.info("Loading full dataset for evaluation metadata...")
-    df_full = pd.read_sql(
-        "SELECT customer_id, product_name, target FROM mart_training_dataset",
-        engine
+    log.info("Loading raw dataset for propensity filter...")
+    df = pd.read_parquet(PARQUET_PATH)
+
+    for col in ["new_customer", "residence_index", "active_customer"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df["segment"] = df["segment"].fillna("UNKNOWN").astype("category")
+    df["sex"] = df["sex"].fillna("UNKNOWN").astype("category")
+    df["gross_income"] = df["gross_income"].fillna(df["gross_income"].median())
+    channel_freq = df["acquisition_channel"].fillna("UNKNOWN").value_counts(normalize=True)
+    df["acquisition_channel_freq"] = df["acquisition_channel"].fillna("UNKNOWN").map(channel_freq).fillna(0)
+
+    # -----------------------------------------------------------
+    # 2. Propensity filter
+    # -----------------------------------------------------------
+    import json
+    log.info("Loading propensity model...")
+    propensity_model_lgb = lgb.Booster(model_file="data/processed/propensity_model.txt")
+    with open("data/processed/propensity_threshold.json") as f:
+        propensity_threshold = json.load(f)["threshold"]
+    log.info(f"Propensity threshold: {propensity_threshold:.2f}")
+
+    customer_features = (
+        df.drop_duplicates(subset=["customer_id"])
+        [["customer_id"] + PROPENSITY_FEATURES]
+        .reset_index(drop=True)
     )
 
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    groups = df_full["customer_id"]
-    _, val_idx = next(splitter.split(df_full, df_full["target"], groups=groups))
-    df_val = df_full.iloc[val_idx].reset_index(drop=True)
+    propensity_scores = propensity_model_lgb.predict(customer_features[PROPENSITY_FEATURES])
+    customer_features["is_propense"] = (propensity_scores >= propensity_threshold).astype(int)
+    propense_customers = set(customer_features[customer_features["is_propense"] == 1]["customer_id"])
+    log.info(f"Propense customers: {len(propense_customers):,}")
 
     # -----------------------------------------------------------
-    # 2. Baseline score (reference point)
+    # 3. Evaluation metadata — only propense customers in val set
     # -----------------------------------------------------------
-    BASELINE_MAP5 = 0.2622
+
+    X_train, X_val, y_train, y_val, groups_train, val_customer_ids  = load_training_data(engine,propense_customers=propense_customers)
+
+    df_val_propense = (
+        df[df["customer_id"].isin(val_customer_ids)]
+        [["customer_id", "product_name", "target"]]
+        .reset_index(drop=True)
+    )
+    log.info(f"Val customers: {df_val_propense['customer_id'].nunique():,}")
+
+    log.info(f"Val customers after propensity filter: {df_val_propense['customer_id'].nunique():,}")
+
+    # recalculate baseline on same population
+    log.info("Recalculating baseline on propense val set...")
+    df_propense_full = df[df["customer_id"].isin(propense_customers)].reset_index(drop=True)
+    popularity = compute_popularity(df_propense_full)
+    recs_baseline = recommend_baseline(df_propense_full, popularity, top_k=5)
+    gt_baseline = df_val_propense[df_val_propense["target"] == 1][["customer_id", "product_name"]]
+    BASELINE_MAP5 = evaluate_baseline(recs_baseline, gt_baseline, k=5)
+    log.info(f"Baseline MAP@5 (propense val): {BASELINE_MAP5:.4f}")
 
     # -----------------------------------------------------------
-    # 3. MLflow experiment
+    # 4. MLflow experiment
     # -----------------------------------------------------------
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5001"))
     mlflow.set_experiment("nbo-recommendation")
 
-    with mlflow.start_run(run_name="lgbm_v1"):
+    with mlflow.start_run(run_name="lgbm_v2_propensity"):
 
         mlflow.log_param("train_rows", len(X_train))
         mlflow.log_param("val_rows", len(X_val))
         mlflow.log_param("n_features", len(ALL_FEATURES))
         mlflow.log_param("train_customers", groups_train.nunique())
+        mlflow.log_param("propense_customers", len(propense_customers))
         mlflow.log_param("baseline_map5", BASELINE_MAP5)
 
         # -----------------------------------------------------------
-        # 4. Train
+        # 5. Train
         # -----------------------------------------------------------
         model = train_model(X_train, y_train, X_val, y_val)
 
         mlflow.log_params({
             "learning_rate": 0.05,
             "num_leaves": 63,
-            "min_child_samples": 100,
+            "min_child_samples": 50,
             "feature_fraction": 0.8,
             "bagging_fraction": 0.8,
             "best_iteration": model.best_iteration,
         })
 
         # -----------------------------------------------------------
-        # 5. Evaluate
+        # 6. Evaluate on propense customers only
         # -----------------------------------------------------------
+        # filter X_val and y_val to propense customers
+        val_customer_ids_mask = pd.Series(X_val.index).isin(df_val_propense.index)
+        propense_mask = pd.Series(val_customer_ids).isin(propense_customers).values
+
+        X_val_propense = X_val.reset_index(drop=True)
+        y_val_propense = y_val.reset_index(drop=True)
+        
         map5 = evaluate_model(
             model = model,
-            X_val = X_val,
-            y_val = y_val,
-            df_val = df_val,
+            X_val = X_val_propense,
+            y_val = y_val_propense,
+            df_val = df_val_propense,
             baseline_score = BASELINE_MAP5,
         )
 
         mlflow.log_metric("val_auc", model.best_score["valid_0"]["auc"])
         mlflow.log_metric("val_map5", map5)
         mlflow.log_metric("baseline_map5", BASELINE_MAP5)
-        mlflow.log_metric("map5_improvement_pct",
-                          (map5 - BASELINE_MAP5) / BASELINE_MAP5 * 100)
+        mlflow.log_metric("map5_improvement_pct", (map5 - BASELINE_MAP5) / BASELINE_MAP5 * 100)
 
         # -----------------------------------------------------------
-        # 6. SHAP feature importance
+        # 7. SHAP
         # -----------------------------------------------------------
-        log.info("Computing SHAP values (sample of 5,000 rows)...")
+        log.info("Computing SHAP values...")
         explainer = shap.TreeExplainer(model)
         sample = X_val.sample(5_000, random_state=42)
         shap_values = explainer.shap_values(sample)
@@ -347,7 +398,7 @@ if __name__ == "__main__":
             "importance": np.abs(shap_values).mean(axis=0)
         }).sort_values("importance", ascending=False)
 
-        log.info("Top 10 features by SHAP importance:")
+        log.info("Top 10 features by SHAP:")
         log.info(shap_importance.head(10).to_string(index=False))
 
         shap_path = "data/processed/shap_importance.csv"
@@ -355,17 +406,18 @@ if __name__ == "__main__":
         mlflow.log_artifact(shap_path)
 
         # -----------------------------------------------------------
-        # 7. Save model
+        # 8. Save model
         # -----------------------------------------------------------
         model_path = "data/processed/lgbm_model.txt"
         model.save_model(model_path)
         mlflow.log_artifact(model_path, artifact_path="model")
         log.info(f"Model saved to {model_path}")
+
         # -----------------------------------------------------------
-        # 8. Final summary
+        # 9. Final summary
         # -----------------------------------------------------------
         log.info("=" * 50)
-        log.info(f"BASELINE MAP@5 : {BASELINE_MAP5:.4f}")
-        log.info(f"MODEL MAP@5 : {map5:.4f}")
-        log.info(f"IMPROVEMENT : {(map5 - BASELINE_MAP5) / BASELINE_MAP5 * 100:+.1f}%")
+        log.info(f"BASELINE MAP@5: {BASELINE_MAP5:.4f}")
+        log.info(f"MODEL MAP@5: {map5:.4f}")
+        log.info(f"IMPROVEMENT: {(map5 - BASELINE_MAP5) / BASELINE_MAP5 * 100:+.1f}%")
         log.info("=" * 50)
