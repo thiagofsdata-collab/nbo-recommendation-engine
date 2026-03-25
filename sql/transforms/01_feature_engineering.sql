@@ -125,13 +125,18 @@ SELECT
     COALESCE(mbf.total_new_products_3m, 0) AS total_new_products_3m,
     COALESCE(mbf.new_products_last_month, 0) AS new_products_last_month
 FROM (
-    SELECT DISTINCT
+    SELECT
         cs.customer_id,
         pc.product_name
     FROM customer_snapshots cs
     CROSS JOIN product_catalog pc
+    LEFT JOIN customer_products cp
+        ON cp.customer_id = cs.customer_id
+        AND cp.product_name = pc.product_name
+        AND cp.snapshot_date = '2016-04-28'
     WHERE cs.snapshot_date = '2016-04-28'
       AND pc.is_active = TRUE
+      AND (cp.has_product = FALSE OR cp.has_product IS NULL)
 ) base
 LEFT JOIN mart_targets mt
     ON  mt.customer_id = base.customer_id
