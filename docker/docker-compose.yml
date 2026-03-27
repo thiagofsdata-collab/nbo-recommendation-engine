@@ -3,15 +3,17 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: nbo_postgres
+    env_file:
+      - ../.env
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - "5432:5432"
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
-      - ../sql/schema:/docker-entrypoint-initdb.d   # runs 01_create_tables.sql on first start
+      - ../sql/schema:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -23,8 +25,6 @@ services:
     container_name: nbo_mlflow
     ports:
       - "5001:5000"
-    environment:
-      - MLFLOW_BACKEND_STORE_URI=sqlite:///mlflow/mlflow.db
     volumes:
       - ../mlflow:/mlflow
     command: >
@@ -33,3 +33,20 @@ services:
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
       --port 5000
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: nbo_api
+    env_file:
+      - ../.env
+    environment:
+      POSTGRES_HOST: postgres
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../data/processed:/app/data/processed
