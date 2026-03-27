@@ -117,15 +117,8 @@ def train_propensity_model(
         "n_jobs": -1,
     }
 
-    train_data = lgb.Dataset(
-        X_train, label=y_train,
-        categorical_feature=["segment", "sex"]
-    )
-    val_data = lgb.Dataset(
-        X_val, label=y_val,
-        categorical_feature=["segment", "sex"],
-        reference=train_data
-    )
+    train_data = lgb.Dataset(X_train, label=y_train)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
     callbacks = [
         lgb.early_stopping(stopping_rounds=50, verbose=True),
@@ -239,6 +232,10 @@ if __name__ == "__main__":
     y_train = y.iloc[train_idx].reset_index(drop=True)
     y_val = y.iloc[val_idx].reset_index(drop=True)
 
+    for col in X_train.select_dtypes(include=["category", "object"]).columns:
+        X_train[col] = pd.Categorical(X_train[col]).codes
+        X_val[col]   = pd.Categorical(X_val[col]).codes
+        
     log.info(f"Train: {len(X_train):,} | Val: {len(X_val):,}")
 
     # Baseline propensity evaluation

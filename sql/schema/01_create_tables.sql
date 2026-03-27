@@ -195,3 +195,34 @@ CREATE INDEX idx_products_customer_date
 CREATE INDEX idx_products_has_product          
     ON customer_products (has_product)
     WHERE has_product = TRUE;                
+
+
+
+-- -----------------------------------------------------------
+-- scores_table — pre-computed recommendations
+-- populated daily by Airflow, consumed by FastAPI
+-- -----------------------------------------------------------
+CREATE TABLE IF NOT EXISTS recommendation_scores (
+    customer_id BIGINT NOT NULL,
+    product_name VARCHAR(50) NOT NULL,
+    score NUMERIC(6,4) NOT NULL,
+    rank SMALLINT NOT NULL,
+    scored_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    model_version VARCHAR(50),
+
+    PRIMARY KEY (customer_id, product_name),
+    CONSTRAINT fk_scores_customer
+        FOREIGN KEY (customer_id)
+        REFERENCES customers (customer_id)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_scores_product
+        FOREIGN KEY (product_name)
+        REFERENCES product_catalog (product_name)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_scores_customer_id
+    ON recommendation_scores (customer_id);
+
+CREATE INDEX idx_scores_rank
+    ON recommendation_scores (customer_id, rank);

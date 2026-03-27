@@ -126,7 +126,7 @@ def load_training_data(engine, propense_customers=None):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     for col in CATEGORICAL_FEATURES:
-        df[col] = df[col].astype("category")
+        df[col] = pd.Categorical(df[col]).codes
 
     missing_features = [col for col in ALL_FEATURES if col not in df.columns]
     if missing_features:
@@ -196,15 +196,8 @@ def train_model(
         "is_unbalance": False, # desliga - usei scale_pos_weight manual
     }
 
-    train_data = lgb.Dataset(
-        X_train, label=y_train,
-        categorical_feature=CATEGORICAL_FEATURES
-    )
-    val_data = lgb.Dataset(
-        X_val, label=y_val,
-        categorical_feature=CATEGORICAL_FEATURES,
-        reference=train_data
-    )
+    train_data = lgb.Dataset(X_train, label=y_train)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
 
     log.info("Training LightGBM model...")
     callbacks = [
